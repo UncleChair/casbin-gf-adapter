@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/casbin/casbin/v2/util"
 	_ "github.com/gogf/gf/contrib/drivers/sqlite/v2"
 	"github.com/gogf/gf/v2/database/gdb"
+	"github.com/gogf/gf/v2/frame/g"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -321,6 +323,193 @@ func TestAddPoliciesFullColumn(t *testing.T) {
 		{"dataB_admin", "dataB", "write"},
 		{"hacker", "dataA", "read", "col3", "col4", "col5", "col6", "col7"},
 		{"jack2", "dataA", "read", "col3", "col4", "col5", "col6", "col7"},
+	})
+	cleanPolicy(ctx, adapter)
+}
+
+func TestCasbinRuleTableName(t *testing.T) {
+	var r CasbinRule
+	assert.Equal(t, defaultTableName, r.TableName())
+}
+
+func TestNewAdapterTableNotFound(t *testing.T) {
+	ctx := context.Background()
+	groupName := setupSQLiteGroup(t)
+	// NewAdapter() is expected to fail (policy table not found), but it may still open a DB connection.
+	// Ensure the connection is closed to avoid sqlite file lock issues during TempDir cleanup.
+	defer func() {
+		_ = g.DB(groupName).Close(ctx)
+	}()
+
+	a, err := NewAdapter(ctx, groupName)
+	assert.Error(t, err)
+	assert.Nil(t, a)
+	assert.True(t, strings.Contains(err.Error(), "casbin policy table not found"))
+}
+
+func TestLoadFilteredPolicyInvalidFilter(t *testing.T) {
+	ctx := context.Background()
+	groupName := setupSQLiteGroup(t)
+	adapter := initAdapter(t, ctx, groupName)
+
+	e, err := casbin.NewEnforcer("examples/rbac_model.conf")
+	assert.NoError(t, err)
+
+	// This should fail early due to invalid filter type.
+	err = adapter.LoadFilteredPolicy(e.GetModel(), "not-a-Filter")
+	assert.Error(t, err)
+}
+
+func TestLoadFilteredPolicyByOtherFields(t *testing.T) {
+	ctx := context.Background()
+	groupName := setupSQLiteGroup(t)
+	adapter := initAdapter(t, ctx, groupName)
+
+	// NewEnforcer() without an adapter will not auto load the policy.
+	e, err := casbin.NewEnforcer("examples/rbac_model.conf")
+	assert.NoError(t, err)
+	e.SetAdapter(adapter)
+
+	// Filter by act (V2).
+	assert.NoError(t, e.LoadFilteredPolicy(Filter{V2: []string{"read"}}))
+	assertPolicy(t, e, [][]string{{"chair", "dataA", "read"}, {"dataB_admin", "dataB", "read"}})
+
+	// Filter by obj (V1).
+	assert.NoError(t, e.LoadFilteredPolicy(Filter{V1: []string{"dataB"}}))
+	assertPolicy(t, e, [][]string{{"uncle", "dataB", "write"}, {"dataB_admin", "dataB", "read"}, {"dataB_admin", "dataB", "write"}})
+
+	// Filter by multiple fields.
+	assert.NoError(t, e.LoadFilteredPolicy(Filter{V0: []string{"dataB_admin"}, V2: []string{"write"}}))
+	assertPolicy(t, e, [][]string{{"dataB_admin", "dataB", "write"}})
+}
+
+func TestLoadPolicyLineEmptyTokens(t *testing.T) {
+	// When ptype + tokens are all empty, toStringPolicy() should return []string{},
+	// and loadPolicyLine() must do nothing.
+	e, err := casbin.NewEnforcer("examples/rbac_model.conf")
+	assert.NoError(t, err)
+
+	policy, err := e.GetPolicy()
+	assert.NoError(t, err)
+	assert.Len(t, policy, 0)
+	loadPolicyLine(CasbinRule{}, e.GetModel())
+	policy, err = e.GetPolicy()
+	assert.NoError(t, err)
+	assert.Len(t, policy, 0)
+}
+
+func TestInsertPolicyLinesEmpty(t *testing.T) {
+	ctx := context.Background()
+	groupName := setupSQLiteGroup(t)
+	adapter := initAdapter(t, ctx, groupName)
+
+	err := adapter.db.Transaction(ctx, func(ctx context.Context, tx gdb.TX) error {
+		// insertPolicyLines() should return nil without touching tx when lines is empty.
+		return insertPolicyLines(ctx, tx, adapter.tableName, nil)
+	})
+	assert.NoError(t, err)
+}
+
+func TestTruncateTable(t *testing.T) {
+	ctx := context.Background()
+	groupName := setupSQLiteGroup(t)
+	adapter := initAdapter(t, ctx, groupName)
+
+	e, err := casbin.NewEnforcer("examples/rbac_model.conf", adapter)
+	assert.NoError(t, err)
+
+	// Sanity check initial policy.
+	assertPolicy(t, e, [][]string{{"chair", "dataA", "read"}, {"uncle", "dataB", "write"}, {"dataB_admin", "dataB", "read"}, {"dataB_admin", "dataB", "write"}})
+
+	// SQLite typically doesn't support TRUNCATE TABLE; depending on the driver it may fail.
+	truncErr := adapter.truncateTable()
+	err = e.LoadPolicy()
+	assert.NoError(t, err)
+
+	policy, err := e.GetPolicy()
+	assert.NoError(t, err)
+	if truncErr == nil {
+		// If TRUNCATE succeeded, policy should be empty.
+		assert.Len(t, policy, 0)
+	} else {
+		// If TRUNCATE failed, policy should remain unchanged.
+		assertPolicy(t, e, [][]string{{"chair", "dataA", "read"}, {"uncle", "dataB", "write"}, {"dataB_admin", "dataB", "read"}, {"dataB_admin", "dataB", "write"}})
+	}
+}
+
+func TestRemovePolicies(t *testing.T) {
+	ctx := context.Background()
+	groupName := setupSQLiteGroup(t)
+	adapter := initAdapter(t, ctx, groupName)
+
+	e, err := casbin.NewEnforcer("examples/rbac_model.conf", adapter)
+	assert.NoError(t, err)
+
+	// Remove two rules at once (Casbin should route to Adapter.RemovePolicies()).
+	err = adapter.RemovePolicies("", "p", [][]string{
+		{"chair", "dataA", "read"},
+		{"dataB_admin", "dataB", "read"},
+	})
+	assert.NoError(t, err)
+
+	assert.NoError(t, e.LoadPolicy())
+	assertPolicy(t, e, [][]string{
+		{"uncle", "dataB", "write"},
+		{"dataB_admin", "dataB", "write"},
+	})
+	cleanPolicy(ctx, adapter)
+}
+
+func TestAddPoliciesEmpty(t *testing.T) {
+	ctx := context.Background()
+	groupName := setupSQLiteGroup(t)
+	adapter := initAdapter(t, ctx, groupName)
+
+	err := adapter.AddPolicies("", "p", [][]string{})
+	assert.NoError(t, err)
+	cleanPolicy(ctx, adapter)
+}
+
+func TestUpdatePoliciesLengthMismatch(t *testing.T) {
+	ctx := context.Background()
+	groupName := setupSQLiteGroup(t)
+	adapter := initAdapter(t, ctx, groupName)
+
+	err := adapter.UpdatePolicies("", "p",
+		[][]string{{"chair", "dataA", "read"}},
+		[][]string{{"chair", "dataA", "write"}, {"uncle", "dataB", "write"}},
+	)
+	assert.Error(t, err)
+	assert.True(t, strings.Contains(err.Error(), "oldRules and newRules length mismatch"))
+	cleanPolicy(ctx, adapter)
+}
+
+func TestFilteredQueryStringOutOfRange(t *testing.T) {
+	var a *Adapter
+
+	whereSQL, whereArgs := a.filteredQueryString("p", 8, []string{"x"})
+	assert.Equal(t, "p_type = ?", whereSQL)
+	assert.Len(t, whereArgs, 1)
+	assert.Equal(t, "p", whereArgs[0])
+}
+
+func TestUpdateFilteredPoliciesEmptyNewPolicies(t *testing.T) {
+	ctx := context.Background()
+	groupName := setupSQLiteGroup(t)
+	adapter := initAdapter(t, ctx, groupName)
+
+	e, err := casbin.NewEnforcer("examples/rbac_model.conf", adapter)
+	assert.NoError(t, err)
+
+	deleted, err := adapter.UpdateFilteredPolicies("", "p", nil /* newPolicies */, 0 /* fieldIndex */, "chair")
+	assert.NoError(t, err)
+	assert.Len(t, deleted, 1)
+
+	assert.NoError(t, e.LoadPolicy())
+	assertPolicy(t, e, [][]string{
+		{"uncle", "dataB", "write"},
+		{"dataB_admin", "dataB", "read"},
+		{"dataB_admin", "dataB", "write"},
 	})
 	cleanPolicy(ctx, adapter)
 }
