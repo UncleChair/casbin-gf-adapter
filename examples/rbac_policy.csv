@@ -1,0 +1,5 @@
+p, chair, dataA, read
+p, uncle, dataB, write
+p, dataB_admin, dataB, read
+p, dataB_admin, dataB, write
+g, chair, dataB_admin
