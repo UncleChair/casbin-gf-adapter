@@ -33,10 +33,6 @@ type CasbinRule struct {
 	V7    string `orm:"v7" json:"v7"`
 }
 
-func (CasbinRule) TableName() string {
-	return defaultTableName
-}
-
 func (c *CasbinRule) toStringPolicy() []string {
 	// Trim only trailing empty tokens, but preserve empty tokens in the middle.
 	// This is important for Casbin rules where some fields can be empty strings.
@@ -63,45 +59,52 @@ type Filter struct {
 	V7    []string
 }
 
-// Adapter represents the Gorm adapter for policy store.
+// Adapter represents the gdb adapter for policy store.
 type Adapter struct {
 	dbGroupName string
 	tableName   string
 	db          gdb.DB
 	ctx         context.Context
 	isFiltered  bool
+	flushBatch  int
 }
 
 // NewAdapter is the constructor for Adapter.
-func NewAdapter(ctx context.Context, groupName string) (*Adapter, error) {
+// Optional tableName is the base policy table name without the gdb group prefix (default "casbin_rule").
+// Omit the argument or pass an empty string to use the default table name.
+func NewAdapter(ctx context.Context, groupName string, tableName ...string) (*Adapter, error) {
+	name := defaultTableName
+	if len(tableName) > 0 && tableName[0] != "" {
+		name = tableName[0]
+	}
 	a := &Adapter{
 		dbGroupName: groupName,
-		tableName:   defaultTableName,
+		tableName:   name,
 		ctx:         ctx,
+		flushBatch:  flushEvery,
 	}
 	// Open the DB and ensure the policy table exists.
-	a.open()
+	if err := a.initDBAndEnsureTable(); err != nil {
+		return nil, err
+	}
 
 	return a, nil
 }
 
-func (a *Adapter) open() {
+func (a *Adapter) initDBAndEnsureTable() error {
 	a.db = g.DB(a.dbGroupName)
-	a.tableName = fmt.Sprintf("%s%s", a.db.GetPrefix(), a.tableName)
 
 	tableList, err := a.db.Tables(a.ctx)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	if slices.Contains(tableList, a.tableName) {
-		return
+	// Adapter always uses the base/raw table name (see NewAdapter). gdb may prepend the
+	// group's table prefix on the wire; Tables() can list the physical name in that case.
+	prefixed := a.db.GetPrefix() + a.tableName
+	if slices.Contains(tableList, a.tableName) || slices.Contains(tableList, prefixed) {
+		return nil
 	}
-	panic(fmt.Sprintf("casbin policy table not found: %s", a.tableName))
-}
-
-func (a *Adapter) truncateTable() error {
-	_, err := a.db.Exec(a.ctx, fmt.Sprintf("TRUNCATE TABLE %s", a.tableName))
-	return err
+	return fmt.Errorf("casbin policy table not found: %s", a.tableName)
 }
 
 func loadPolicyLine(line CasbinRule, model model.Model) {
@@ -110,6 +113,11 @@ func loadPolicyLine(line CasbinRule, model model.Model) {
 		return
 	}
 	persist.LoadPolicyArray(tokens, model)
+}
+
+// TableName returns the name of the policy table.
+func (a *Adapter) TableName() string {
+	return a.tableName
 }
 
 // LoadPolicy loads policy from database.
@@ -233,7 +241,7 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 			return err
 		}
 
-		pending := make([]CasbinRule, 0, flushEvery)
+		pending := make([]CasbinRule, 0, a.flushBatch)
 		flush := func() error {
 			if err := insertPolicyLines(ctx, tx, a.tableName, pending); err != nil {
 				return err
@@ -245,7 +253,7 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 		for ptype, assertion := range model["p"] {
 			for _, rule := range assertion.Policy {
 				pending = append(pending, a.savePolicyLine(ptype, rule))
-				if len(pending) >= flushEvery {
+				if len(pending) >= a.flushBatch {
 					if err := flush(); err != nil {
 						return err
 					}
@@ -256,7 +264,7 @@ func (a *Adapter) SavePolicy(model model.Model) error {
 		for ptype, assertion := range model["g"] {
 			for _, rule := range assertion.Policy {
 				pending = append(pending, a.savePolicyLine(ptype, rule))
-				if len(pending) >= flushEvery {
+				if len(pending) >= a.flushBatch {
 					if err := flush(); err != nil {
 						return err
 					}

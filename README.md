@@ -21,23 +21,22 @@ This project provides a Casbin adapter based on GoFrame's `gdb`. It stores Casbi
 Update `config/config.yaml` (or your own GoFrame config) to set:
 
 - `database.<group>.link`: your DB connection string
-- `database.<group>.prefix`: table name prefix
+- `database.<group>.prefix`: table name prefix (prefer `""` for this group so the physical table is `casbin_rule`, same as docs and `NewAdapter` defaults)
 - `database.<group>.debug`: optional
 
-The adapter uses:
+The adapter uses the **base table name** `casbin_rule` (overridable via `NewAdapter`'s optional `tableName` argument). If your gdb group uses a non-empty prefix, migrate the physical table gdb expects (`<prefix>casbin_rule`); the adapter API still takes the base name only.
 
-- table name = `<prefix>casbin_rule`
-- columns: `id`, `p_type`, `v0`..`v7`
+Columns: `id`, `p_type`, `v0`..`v7`
 
 ### Create the policy table (strict mode)
 
 The adapter is in **strict mode**: it will **not** auto-create the table during `NewAdapter`.
-If the table does not exist, initialization fails.
+If the table does not exist, `NewAdapter` returns an error.
 
-Example (MySQL/MariaDB-style DDL; replace `sys_` with your configured prefix):
+Example (MySQL/MariaDB-style DDL; base table name `casbin_rule` when `prefix` is empty):
 
 ```sql
-CREATE TABLE IF NOT EXISTS sys_casbin_rule (
+CREATE TABLE IF NOT EXISTS casbin_rule (
   id bigint unsigned AUTO_INCREMENT,
   p_type VARCHAR(100),
   v0 VARCHAR(100),
@@ -49,7 +48,7 @@ CREATE TABLE IF NOT EXISTS sys_casbin_rule (
   v6 VARCHAR(25),
   v7 VARCHAR(25),
   PRIMARY KEY (id),
-  UNIQUE KEY idx_sys_casbin_rule (p_type, v0, v1, v2, v3, v4, v5, v6, v7)
+  UNIQUE KEY idx_casbin_rule (p_type, v0, v1, v2, v3, v4, v5, v6, v7)
 );
 ```
 
@@ -69,18 +68,29 @@ import (
 func main() {
 	// Initialize a gdb adapter and use it in a Casbin enforcer:
 	// The adapter will use the database source configured for the given gdb group.
-	// (The final table name is derived from your GoFrame gdb configuration: <prefix>casbin_rule.)
+	// (Use base table name casbin_rule; set gdb prefix to "" for that group unless you migrate <prefix>casbin_rule.)
 	ctx := context.Background()
-	a, _ := gdbadapter.NewAdapter(ctx, gdb.DefaultGroupName)
-	e, _ := casbin.NewEnforcer("examples/rbac_model.conf", a)
+	a, err := gdbadapter.NewAdapter(ctx, gdb.DefaultGroupName)
+	if err != nil {
+		panic(err)
+	}
+	e, err := casbin.NewEnforcer("examples/rbac_model.conf", a)
+	if err != nil {
+		panic(err)
+	}
 
 	// Load the policy from DB.
-	_ = e.LoadPolicy()
+	if err := e.LoadPolicy(); err != nil {
+		panic(err)
+	}
 
 	// Check the permission.
 	// Pick a subject/object/action that exists in your policies.
 	// See examples/rbac_policy.csv for the sample values.
-	ok, _ := e.Enforce("chair", "dataA", "read")
+	ok, err := e.Enforce("chair", "dataA", "read")
+	if err != nil {
+		panic(err)
+	}
 	_ = ok
 
 	// Modify the policy.
@@ -88,7 +98,9 @@ func main() {
 	// e.RemovePolicy(...)
 
 	// Save the policy back to DB.
-	_ = e.SavePolicy()
+	if err := e.SavePolicy(); err != nil {
+		panic(err)
+	}
 }
 ```
 

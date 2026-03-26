@@ -27,7 +27,7 @@ func setupSQLiteGroup(t *testing.T) string {
 		{
 			Type:   "sqlite",
 			Link:   link,
-			Prefix: "sys_",
+			Prefix: "",
 			Debug:  false,
 		},
 	})
@@ -37,9 +37,10 @@ func setupSQLiteGroup(t *testing.T) string {
 
 // createPolicyTableForGroup is a helper for tests/migrations only.
 // It creates the Casbin policy table if it doesn't exist.
+// Use the base table name (e.g. casbin_rule); tests use an empty gdb prefix so the physical name matches.
 func createPolicyTableForGroup(ctx context.Context, groupName string) error {
 	db := g.DB(groupName)
-	tableName := fmt.Sprintf("%s%s", db.GetPrefix(), defaultTableName)
+	tableName := defaultTableName
 	dbType := db.GetConfig().Type
 
 	switch dbType {
@@ -354,9 +355,11 @@ func TestAddPoliciesFullColumn(t *testing.T) {
 	cleanPolicy(ctx, adapter)
 }
 
-func TestCasbinRuleTableName(t *testing.T) {
-	var r CasbinRule
-	assert.Equal(t, defaultTableName, r.TableName())
+func TestAdapterDefaultTableName(t *testing.T) {
+	ctx := context.Background()
+	groupName := setupSQLiteGroup(t)
+	adapter := initAdapter(t, ctx, groupName)
+	assert.True(t, strings.HasSuffix(adapter.TableName(), defaultTableName))
 }
 
 func TestNewAdapterTableNotFound(t *testing.T) {
@@ -368,15 +371,9 @@ func TestNewAdapterTableNotFound(t *testing.T) {
 		_ = g.DB(groupName).Close(ctx)
 	}()
 
-	var panicVal any
-	func() {
-		defer func() {
-			panicVal = recover()
-		}()
-		_, _ = NewAdapter(ctx, groupName)
-	}()
-	assert.NotNil(t, panicVal)
-	assert.True(t, strings.Contains(fmt.Sprint(panicVal), "casbin policy table not found"))
+	_, err := NewAdapter(ctx, groupName)
+	assert.Error(t, err)
+	assert.True(t, strings.Contains(err.Error(), "casbin policy table not found"))
 }
 
 func TestLoadFilteredPolicyInvalidFilter(t *testing.T) {
@@ -440,33 +437,6 @@ func TestInsertPolicyLinesEmpty(t *testing.T) {
 		return insertPolicyLines(ctx, tx, adapter.tableName, nil)
 	})
 	assert.NoError(t, err)
-}
-
-func TestTruncateTable(t *testing.T) {
-	ctx := context.Background()
-	groupName := setupSQLiteGroup(t)
-	adapter := initAdapter(t, ctx, groupName)
-
-	e, err := casbin.NewEnforcer("examples/rbac_model.conf", adapter)
-	assert.NoError(t, err)
-
-	// Sanity check initial policy.
-	assertPolicy(t, e, [][]string{{"chair", "dataA", "read"}, {"uncle", "dataB", "write"}, {"dataB_admin", "dataB", "read"}, {"dataB_admin", "dataB", "write"}})
-
-	// SQLite typically doesn't support TRUNCATE TABLE; depending on the driver it may fail.
-	truncErr := adapter.truncateTable()
-	err = e.LoadPolicy()
-	assert.NoError(t, err)
-
-	policy, err := e.GetPolicy()
-	assert.NoError(t, err)
-	if truncErr == nil {
-		// If TRUNCATE succeeded, policy should be empty.
-		assert.Len(t, policy, 0)
-	} else {
-		// If TRUNCATE failed, policy should remain unchanged.
-		assertPolicy(t, e, [][]string{{"chair", "dataA", "read"}, {"uncle", "dataB", "write"}, {"dataB_admin", "dataB", "read"}, {"dataB_admin", "dataB", "write"}})
-	}
 }
 
 func TestRemovePolicies(t *testing.T) {
