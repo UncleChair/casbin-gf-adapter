@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/casbin/casbin/v2/model"
@@ -79,72 +80,23 @@ func NewAdapter(ctx context.Context, groupName string) (*Adapter, error) {
 		ctx:         ctx,
 	}
 	// Open the DB and ensure the policy table exists.
-	if err := a.open(); err != nil {
-		return nil, err
-	}
+	a.open()
 
 	return a, nil
 }
 
-func (a *Adapter) open() error {
+func (a *Adapter) open() {
 	a.db = g.DB(a.dbGroupName)
 	a.tableName = fmt.Sprintf("%s%s", a.db.GetPrefix(), a.tableName)
-	return a.createTable()
-}
 
-// HasTable determine whether the table name exists in the database.
-func (a *Adapter) HasTable(name string) (bool, error) {
 	tableList, err := a.db.Tables(a.ctx)
 	if err != nil {
-		return false, err
+		panic(err)
 	}
-	for _, table := range tableList {
-		if table == name {
-			return true, nil
-		}
+	if slices.Contains(tableList, a.tableName) {
+		return
 	}
-	return false, nil
-}
-
-func (a *Adapter) createTable() error {
-	// Strict mode:
-	// - Do not auto-create the policy table.
-	// - If the table does not exist, return an error so that misconfiguration is detected early.
-	exists, err := a.HasTable(a.tableName)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return fmt.Errorf("casbin policy table not found: %s", a.tableName)
-	}
-	return nil
-}
-
-// createPolicyTableForGroup is a helper for tests/migrations only.
-// It creates the Casbin policy table if it doesn't exist.
-func createPolicyTableForGroup(ctx context.Context, groupName string) error {
-	db := g.DB(groupName)
-	tableName := fmt.Sprintf("%s%s", db.GetPrefix(), defaultTableName)
-	dbType := db.GetConfig().Type
-
-	switch dbType {
-	case "sqlite":
-		// SQLite-friendly DDL:
-		// - `id` uses AUTOINCREMENT to mimic MySQL's auto increment primary key.
-		// - All policy tokens are stored as TEXT.
-		_, err := db.Exec(ctx, fmt.Sprintf(
-			"CREATE TABLE IF NOT EXISTS `%s` (`id` INTEGER PRIMARY KEY AUTOINCREMENT,`p_type` TEXT,`v0` TEXT,`v1` TEXT,`v2` TEXT,`v3` TEXT,`v4` TEXT,`v5` TEXT,`v6` TEXT,`v7` TEXT,UNIQUE (`p_type`,`v0`,`v1`,`v2`,`v3`,`v4`,`v5`,`v6`,`v7`))",
-			tableName,
-		))
-		return err
-	default:
-		// Default to MySQL/MariaDB-like DDL.
-		_, err := db.Exec(ctx, fmt.Sprintf(
-			"CREATE TABLE IF NOT EXISTS %s (`id` bigint unsigned AUTO_INCREMENT,`p_type` VARCHAR(100),`v0` VARCHAR(100),`v1` VARCHAR(100),`v2` VARCHAR(100),`v3` VARCHAR(100),`v4` VARCHAR(100),`v5` VARCHAR(100), `v6` VARCHAR(25), `v7` VARCHAR(25),PRIMARY KEY (`id`),UNIQUE KEY `idx_%s` (`p_type`,`v0`,`v1`,`v2`,`v3`,`v4`,`v5`,`v6`,`v7`))",
-			tableName, tableName,
-		))
-		return err
-	}
+	panic(fmt.Sprintf("casbin policy table not found: %s", a.tableName))
 }
 
 func (a *Adapter) truncateTable() error {
